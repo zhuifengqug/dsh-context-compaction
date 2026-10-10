@@ -10,13 +10,15 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
     "src",
     "test",
-    "README.md"
+    "README.md",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
   "keywords": [
@@ -27,6 +29,11 @@
     "context-window",
     "summarization"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
