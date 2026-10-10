@@ -129,7 +129,12 @@ test('status reports official meter pressure and durable compaction intervals', 
   const status = registered.find((tool) => tool.name === 'context_status')
   const value = await status.execute({}, exec())
   assert.equal(value.occupancy.totalTokens, 200)
-  assert.equal(value.occupancy.thresholdTokens, 100)
+  // F2 regression: the field must NOT be named thresholdTokens and must not
+  // claim to be the trigger point. The real trigger is computed by the
+  // official engine from the routed model WINDOW, not from occupancy.
+  assert.equal(value.occupancy.thresholdTokens, undefined)
+  assert.equal(value.occupancy.occupancyRatioReference, 100)
+  assert.match(value.occupancy.thresholdNote, /NOT the trigger point/)
   assert.equal(value.compactions.length, 1)
   assert.equal(value.compactions[0].compactionId, 'c1')
   assert.equal(value.compactions[0].status, 'completed')
@@ -140,6 +145,76 @@ test('search helpers use literal terms and return shadowed seq hits', () => {
   const hits = searchReadableEvents([{ seq: 7, type: 'user/message', data: { content: [{ type: 'text', text: 'the needle is here' }] } }], ['needle'], 'shadowed', 10)
   assert.equal(hits.length, 1)
   assert.equal(hits[0].seq, 7)
+})
+
+// ---------------------------------------------------------------------------
+// t4 findings F1 / F2 — regression tests (added by t6 repair)
+// ---------------------------------------------------------------------------
+
+// F1 regression (t4 minimal repro C2d): a text that appears ONLY on a
+// non-shadowed seq must not be returned when surface='shadowed' (the default).
+test('F1: surface=shadowed filters out non-shadowed hits', async () => {
+  const { ctx, registered } = harnessContext()
+  registerVisibilityTools(ctx, {
+    sessionQuery: { observeSession: () => ({ events: [...events, { seq: 7, type: 'user/message', data: { content: [{ type: 'text', text: 'needle-visible' }] } }] }) },
+    tokenMeter: { measure: () => ({ totalTokens: 10, nodes: [] }) },
+    compaction: { config: { thresholdRatio: 0.5, headroomTokens: 100 } },
+  })
+  const search = registered.find((tool) => tool.name === 'context_search')
+
+  const shadowed = await search.execute({ query: 'needle-visible', surface: 'shadowed' }, exec())
+  assert.equal(shadowed.hitCount, 0, 'a log-only hit must not appear on the shadowed surface')
+
+  const all = await search.execute({ query: 'needle-visible', surface: 'all' }, exec())
+  assert.equal(all.hitCount, 1, 'surface=all must still surface log-only hits')
+  assert.equal(all.hits[0].seq, 7)
+  assert.equal(all.hits[0].surface, 'log-only')
+})
+
+// F1 regression: the filter must apply BEFORE the limit is consumed, so a
+// small limit can never be filled by excluded events.
+test('F1: shadowed filter is applied before the result limit', async () => {
+  const noise = Array.from({ length: 5 }, (_, index) => ({
+    seq: 100 + index,
+    type: 'user/message',
+    data: { content: [{ type: 'text', text: 'needle-noise' }] },
+  }))
+  const hits = searchReadableEvents(
+    [...noise, { seq: 3, type: 'user/message', data: { content: [{ type: 'text', text: 'needle-shadowed' }] } }],
+    ['needle'],
+    (event) => (event.seq === 3 ? 'shadowed' : 'log-only'),
+    2,
+    'shadowed',
+  )
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0].seq, 3)
+})
+
+// F2 regression (t4 minimal repro C3c): the reported value must not be
+// presented as a trigger threshold, and its name must not imply one.
+test('F2: status exposes a ratio reference, never a drifting "thresholdTokens"', async () => {
+  const build = async (totalTokens) => {
+    const { ctx, registered } = harnessContext()
+    registerVisibilityTools(ctx, {
+      sessionQuery: { observeSession: () => ({ events }) },
+      tokenMeter: { measure: () => ({ totalTokens, nodes: [] }) },
+      compaction: { config: { thresholdRatio: 0.5, headroomTokens: 1000 } },
+    })
+    const status = registered.find((tool) => tool.name === 'context_status')
+    return status.execute({}, exec())
+  }
+
+  const small = await build(20000)
+  const large = await build(40000)
+
+  assert.equal(small.occupancy.thresholdTokens, undefined)
+  assert.equal(small.occupancy.occupancyRatioReference, 10000)
+  assert.equal(large.occupancy.occupancyRatioReference, 20000)
+  // The value does drift (it is occupancy-scaled by construction) — which is
+  // exactly why it must not be named or described as the trigger threshold.
+  assert.notEqual(small.occupancy.occupancyRatioReference, large.occupancy.occupancyRatioReference)
+  assert.match(small.occupancy.thresholdNote, /contextWindow/)
+  assert.match(small.occupancy.thresholdNote, /NOT the trigger point/)
 })
 
 test('exportOriginal rejects paths outside the workspace root', async () => {

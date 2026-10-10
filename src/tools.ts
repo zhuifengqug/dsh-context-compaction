@@ -419,22 +419,34 @@ function makeSnippet(text: string, term: string): string {
   return (at > 0 ? '…' : '') + text.slice(at, end).replace(/\s+/gu, ' ') + (end < text.length ? '…' : '')
 }
 
-/** Search readable text from a set of events and return bounded hits. */
+/** How a hit's durability surface is classified relative to compaction. */
+export type SearchSurfaceFilter = 'shadowed' | 'all'
+
+/** Search readable text from a set of events and return bounded hits.
+ *
+ * `surfaceOf` classifies each event (typically 'shadowed' vs 'log-only').
+ * `filter` decides which classes may be returned: `'shadowed'` keeps only
+ * events the compaction records actually shadowed, `'all'` keeps every
+ * readable event. The filter is applied BEFORE the limit is consumed, so a
+ * bounded result is never silently filled with events the caller excluded.
+ */
 export function searchReadableEvents(
   events: readonly SessionEventLike[],
   terms: readonly string[],
   surface: string | null | ((event: SessionEventLike) => string),
   limit: number,
+  filter: SearchSurfaceFilter = 'all',
 ): SearchHit[] {
   const hits: SearchHit[] = []
   for (const event of events) {
     if (hits.length >= limit) break
     const seq = eventSeq(event)
     if (seq === null) continue
+    const resolvedSurface = typeof surface === 'function' ? surface(event) : (surface ?? 'log-only')
+    if (filter === 'shadowed' && resolvedSurface !== 'shadowed') continue
     const text = readableEventText(event)
     const lower = text.toLocaleLowerCase()
     if (!terms.every((term) => lower.includes(term))) continue
-    const resolvedSurface = typeof surface === 'function' ? surface(event) : (surface ?? 'log-only')
     hits.push({
       seq,
       surface: resolvedSurface,
@@ -463,16 +475,25 @@ export function buildStatusValue(input: {
   occupancy: { totalTokens: number; visibleNodeCount: number }
   records: readonly CompactionRecord[]
 }): JsonValue {
-  const thresholdTokens = Math.floor(input.occupancy.totalTokens * input.policy.thresholdRatio)
+  // NOTE: this is deliberately NOT named `thresholdTokens`. The real trigger
+  // point is floor(min(contextWindow * thresholdRatio,
+  // contextWindow - reservedOutput - headroomTokens)) — a function of the
+  // routed model's WINDOW, not of current occupancy. This tool cannot resolve
+  // the window (that needs ctx.llm.resolveModelInfo, unavailable from a tool
+  // body), so multiplying occupancy by the ratio would produce a number that
+  // drifts with occupancy and is NOT the threshold. Exposing it as a
+  // ratio-scaled reference avoids reporting a fake trigger point.
+  const occupancyRatioReference = Math.floor(input.occupancy.totalTokens * input.policy.thresholdRatio)
   return {
     sessionId: input.sessionId,
     occupancy: {
       totalTokens: input.occupancy.totalTokens,
       visibleNodeCount: input.occupancy.visibleNodeCount,
       thresholdRatio: input.policy.thresholdRatio,
-      thresholdTokens,
+      occupancyRatioReference,
       headroomTokens: input.policy.headroomTokens,
       note: 'Occupancy is the official tokenMeter.measure(session).totalTokens pressure estimate, not a provider billing record.',
+      thresholdNote: 'The real auto-compaction trigger is floor(min(contextWindow * thresholdRatio, contextWindow - reservedOutput - headroomTokens)), computed by the official engine from the routed model window. occupancyRatioReference above is totalTokens * thresholdRatio — a ratio-scaled reference that CHANGES with occupancy and is NOT the trigger point.',
     },
     compactions: input.records.map((record) => {
       const compacted: Record<string, JsonValue> = {
@@ -640,14 +661,15 @@ export function registerVisibilityTools(ctx: Context, options?: ToolContextOptio
             : 20
           const shadowedSeqs = new Set(collectCompactionRecords(prepared.events).flatMap((record) => record.shadowedSeqs))
           // A shadowed surface node may be referenced by `shadowedSeqs` while
-          // the durable event wrapper itself is log-only; therefore search
-          // the full durable log and attach the seq classification.
+          // the durable event wrapper itself is log-only; therefore classify
+          // over the full durable log, then let the filter drop non-shadowed
+          // events when surface='shadowed' (the default).
           const candidates = prepared.events
           const surfaceOf = (event: SessionEventLike): string => {
             const seq = eventSeq(event)
             return seq !== null && shadowedSeqs.has(seq) ? 'shadowed' : 'log-only'
           }
-          const hits = searchReadableEvents(candidates, terms, surfaceOf, limit)
+          const hits = searchReadableEvents(candidates, terms, surfaceOf, limit, surface)
           return buildSearchValue({ sessionId: prepared.sessionId, query: args.query, surface, hits, truncated: hits.length >= limit })
         } catch (error) {
           return errorValue(error)
