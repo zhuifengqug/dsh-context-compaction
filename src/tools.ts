@@ -596,7 +596,7 @@ export function registerVisibilityTools(ctx: Context, options?: ToolContextOptio
   const disposers = [
     ctx.tools.register(defineTool({
       name: 'context_status',
-      description: 'Show the current context occupancy, the configured compaction threshold and headroom, and every compacted interval in this session. Use this before deciding whether an old topic has been compacted.',
+      description: 'Show the current context occupancy, the configured threshold policy (ratio + headroom), and every compacted interval in this session. Use this before deciding whether an old topic has been compacted. Note: the real auto-compaction trigger is computed by the official engine from the routed model window; this tool cannot resolve that window, so it reports the policy numbers and a ratio-scaled reference rather than a trigger point.',
       parameters: {},
       output: {
         schema: { type: 'json' },
