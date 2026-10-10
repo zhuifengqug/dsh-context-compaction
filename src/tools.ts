@@ -1,29 +1,27 @@
 /**
- * Visibility and rollback tools for compaction:
+ * Three native DSH tools for compaction visibility and rollback:
  *
- * - `context_status`: current token occupancy, configured thresholds,
- *   remaining headroom, and compacted intervals read from durable
- *   `compaction/summary` events.
- * - `context_expand`: read the original (shadowed) events for a seq range
- *   through `ctx.sessionQuery` and export them to a workspace file. The host
- *   has no un-replace API; this tool does not and cannot put the original
- *   back on the model-visible surface. The result states that limitation
- *   explicitly and tells the model to read the exported file.
- * - `context_search`: search only `shadowed` events for a query and return
- *   bounded hits with their seq numbers.
+ * - `context_status`: model-facing current occupancy, configured threshold,
+ *   headroom, and the durable compacted intervals.
+ * - `context_expand`: read shadowed original events by seq range through
+ *   `ctx.sessionQuery` and export them to a workspace file. The host has no
+ *   un-replace API; the result explicitly says the original was not restored
+ *   to the model-visible surface and must be read from the exported file.
+ * - `context_search`: search only shadowed events and return hits with seq.
  *
- * Error paths are explicit: missing sessionQuery, invalid ranges, missing
- * seqs, and sessions with no compacted records return `isError: true` with
- * actionable text; nothing is silently ignored.
+ * The tools are registered in the same preset compaction realm as the engine.
+ * `session.eventAt` is deprecated and is not the main path; all rollback
+ * reads go through `ctx.sessionQuery`.
  *
- * @module @gjs27/dsh-context-compaction/tools
+ * @module @gjs27/dsh-context-compaction/visibility
  */
 
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 
 /** Session sequence number. */
 export type SessionSeq = number
@@ -32,7 +30,7 @@ export type SessionSeq = number
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
 /** Durable compaction transaction summary read from the session log. */
-export interface CompactionRecord extends Record<string, JsonValue> {
+export interface CompactionRecord {
   compactionId: string
   seq: SessionSeq
   shadowedRange: { start: SessionSeq; end: SessionSeq }
@@ -44,6 +42,7 @@ export interface CompactionRecord extends Record<string, JsonValue> {
   status: 'pending' | 'completed' | 'failed'
   summarySeq: SessionSeq
   endSeq: SessionSeq | null
+  sourceCommandId?: string
   error?: string
 }
 
@@ -59,32 +58,9 @@ export interface SessionEventLike {
 /** Structural view of the non-deprecated `ctx.sessionQuery` service. */
 export interface SessionQueryLike {
   observeSession(sessionId: string, options?: Record<string, unknown>): Promise<SessionObservationLike> | SessionObservationLike
-  listEvents?(sessionId: string): Promise<SessionEventRecordLike[]> | SessionEventRecordLike[]
-  filterEvents?(sessionId: string, filters?: Record<string, unknown>): Promise<SessionSearchDocumentLike[]> | SessionSearchDocumentLike[]
-  readSession?(sessionId: string): Promise<SessionLogSnapshotLike> | SessionLogSnapshotLike
 }
 
 export interface SessionObservationLike {
-  readonly events: readonly SessionEventLike[]
-  readonly [key: string]: unknown
-}
-
-export interface SessionEventRecordLike {
-  readonly seq?: SessionSeq
-  readonly surface?: string
-  readonly type?: string
-  readonly [key: string]: unknown
-}
-
-export interface SessionSearchDocumentLike {
-  readonly seq?: SessionSeq
-  readonly text?: string
-  readonly surface?: string
-  readonly type?: string
-  readonly [key: string]: unknown
-}
-
-export interface SessionLogSnapshotLike {
   readonly events: readonly SessionEventLike[]
   readonly [key: string]: unknown
 }
@@ -94,19 +70,27 @@ export interface AgentLike {
   readonly session?: {
     readonly id?: string
     readonly surface?: { readonly nodes?: readonly SessionSeq[] }
-    readonly eventAt?: (seq: SessionSeq) => SessionEventLike | undefined
   }
-  readonly options?: {
-    readonly cwd?: string
-    readonly workspace?: string
-  }
+  readonly options?: { readonly cwd?: string; readonly workspace?: string }
   readonly cwd?: string
   readonly workspace?: string
 }
 
-export interface CompactionToolOptions {
+export interface TokenMeterLike {
+  measure(session: unknown): { readonly totalTokens?: unknown; readonly nodes?: readonly { readonly heuristicTokens?: unknown }[] }
+}
+
+export interface CompactionServiceLike {
+  readonly config?: {
+    readonly thresholdRatio?: unknown
+    readonly headroomTokens?: unknown
+  }
+}
+
+export interface ToolContextOptions {
   readonly sessionQuery?: SessionQueryLike
-  readonly exportRoot?: string
+  readonly tokenMeter?: TokenMeterLike
+  readonly compaction?: CompactionServiceLike
 }
 
 /** Tool error with an explicit code and user-facing message. */
@@ -119,48 +103,8 @@ export class ContextToolError extends Error {
 
 interface PreparedTool {
   readonly sessionId: string
-  readonly query: SessionQueryLike
   readonly events: readonly SessionEventLike[]
-}
-
-/**
- * Resolve and validate one execution's session query and full durable event
- * log. Fails explicitly for a missing service, missing session, or empty log.
- */
-export async function prepareSessionQuery(
-  ctx: Context,
-  exec: ToolRunContext,
-  agent?: AgentLike,
-): Promise<PreparedTool> {
-  const query = ctx.get('sessionQuery') as SessionQueryLike | undefined
-  if (query === void 0 || typeof query.observeSession !== 'function') {
-    throw new ContextToolError('ctx.sessionQuery is unavailable: install/enable @deepseek-ai/dsh-session-query (compaction history cannot be read without it)', 'SESSION_QUERY_UNAVAILABLE')
-  }
-  const sessionId = resolveSessionId(exec, agent)
-  if (sessionId.length === 0) throw new ContextToolError('no session id is available on this execution', 'SESSION_ID_UNAVAILABLE')
-  let observation: SessionObservationLike
-  try {
-    observation = await query.observeSession(sessionId)
-  } catch (error) {
-    throw new ContextToolError(`sessionQuery.observeSession("${sessionId}") failed: ${errorMessage(error)}`, 'SESSION_QUERY_READ_FAILED')
-  }
-  const events = Array.isArray(observation?.events) ? observation.events : []
-  if (events.length === 0) {
-    throw new ContextToolError(`session "${sessionId}" has no durable events; nothing can be inspected`, 'SESSION_EMPTY')
-  }
-  return { sessionId, query, events }
-}
-
-function resolveSessionId(exec: ToolRunContext, agent?: AgentLike): string {
-  const candidate = (exec as { sessionId?: unknown }).session?.id
-    ?? (exec as { sessionId?: unknown }).sessionId
-    ?? agent?.session?.id
-    ?? ''
-  return typeof candidate === 'string' ? candidate : ''
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  readonly session: unknown
 }
 
 /** Extract the event seq, accepting both top-level and nested seq fields. */
@@ -190,6 +134,43 @@ export function stringify(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+/** Resolve and validate one execution's session query and full durable log. */
+export async function prepareSessionQuery(
+  ctx: Context,
+  exec: ToolRunContext,
+  agent?: AgentLike,
+  options?: ToolContextOptions,
+): Promise<PreparedTool> {
+  const query = options?.sessionQuery ?? ctx.get('sessionQuery') as SessionQueryLike | undefined
+  if (query === void 0 || typeof query.observeSession !== 'function') {
+    throw new ContextToolError('ctx.sessionQuery is unavailable: enable @deepseek-ai/dsh-session-query so compaction history can be read', 'SESSION_QUERY_UNAVAILABLE')
+  }
+  const sessionId = resolveSessionId(exec, agent)
+  if (sessionId.length === 0) throw new ContextToolError('no session id is available on this execution', 'SESSION_ID_UNAVAILABLE')
+  let observation: SessionObservationLike
+  try {
+    observation = await query.observeSession(sessionId)
+  } catch (error) {
+    throw new ContextToolError(`sessionQuery.observeSession("${sessionId}") failed: ${errorMessage(error)}`, 'SESSION_QUERY_READ_FAILED')
+  }
+  const events = Array.isArray(observation?.events) ? observation.events : []
+  if (events.length === 0) throw new ContextToolError(`session "${sessionId}" has no durable events; nothing can be inspected`, 'SESSION_EMPTY')
+  return { sessionId, events, session: (observation as { session?: unknown }).session }
+}
+
+function resolveSessionId(exec: ToolRunContext, agent?: AgentLike): string {
+  const execution = exec as unknown as { session?: { readonly id?: unknown }; sessionId?: unknown }
+  const candidate = (execution.session !== null && typeof execution.session === 'object' ? execution.session.id : void 0)
+    ?? execution.sessionId
+    ?? agent?.session?.id
+    ?? ''
+  return typeof candidate === 'string' ? candidate : ''
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** Collect summary text blocks from a compaction/summary payload. */
@@ -229,9 +210,8 @@ function readOptionalText(value: unknown): string | undefined {
 
 /**
  * Parse every durable compaction transaction into explicit records. Start and
- * summary events are merged by compactionId; a summary without start or an
- * unterminated transaction is reported with its exact status rather than being
- * dropped.
+ * summary events are merged by compactionId; an unterminated or failed
+ * transaction keeps its exact status rather than being dropped.
  */
 export function collectCompactionRecords(events: readonly SessionEventLike[]): CompactionRecord[] {
   interface Pending { seq: SessionSeq; sourceCommandId?: string }
@@ -284,74 +264,26 @@ export function collectCompactionRecords(events: readonly SessionEventLike[]): C
   return [...records.values()].sort((a, b) => a.seq - b.seq)
 }
 
-/**
- * Count only current surface nodes and resolve their heuristic token cost
- * through the compaction engine's event-derived metric. The tool intentionally
- * derives the same `shadowedTokenCount` denominator shape as the official
- * engine: surface nodes are the payload, and occupancy is `sum(eventHeuristicTokens)`.
- */
-export function surfaceStats(
-  events: readonly SessionEventLike[],
-  surfaceSeqs: readonly SessionSeq[],
-): { occupied: number; nodeCount: number } {
-  const bySeq = new Map<SessionSeq, SessionEventLike>()
-  for (const event of events) {
-    const seq = eventSeq(event)
-    if (seq !== null) bySeq.set(seq, event)
-  }
-  let occupied = 0
-  let nodeCount = 0
-  for (const seq of surfaceSeqs) {
-    const event = bySeq.get(seq)
-    if (event === void 0) continue
-    nodeCount += 1
-    occupied += eventHeuristicTokens(event)
-  }
-  return { occupied, nodeCount }
-}
-
-/**
- * Heuristic token estimate matching the official compaction denominator's
- * event projection: message content blocks plus tool names and JSON arguments.
- */
-export function eventHeuristicTokens(event: SessionEventLike): number {
-  const data = eventData(event)
-  const blocks = data.content
-  let tokens = 0
-  if (Array.isArray(blocks)) {
-    for (const block of blocks) {
-      if (block !== null && typeof block === 'object' && (block as { type?: unknown }).type === 'text') {
-        tokens += textHeuristicTokens(stringify((block as { text?: unknown }).text))
-      } else if (block !== null && typeof block === 'object' && (block as { type?: unknown }).type === 'toolUse') {
-        tokens += textHeuristicTokens(stringify((block as { name?: unknown }).name))
-        tokens += textHeuristicTokens(stringify((block as { input?: unknown }).input))
-      } else if (block !== null && typeof block === 'object' && (block as { type?: unknown }).type === 'toolResult') {
-        const result = (block as { content?: unknown }).content
-        tokens += textHeuristicTokens(stringify(result))
-      }
-    }
-  }
-  return tokens
-}
-
-/** Conservative public estimate: ~4 Unicode characters per token. */
-export function textHeuristicTokens(text: string): number {
-  return Math.ceil(text.length / 4)
-}
-
-/** Resolve the official policy numbers without reading private engine state. */
+/** Resolve official pressure policy numbers without private engine access. */
 export function readPolicy(
-  compaction: unknown,
-  event: SessionEventLike,
-): { thresholdRatio: number; headroomTokens: number; occupied: number } {
-  const source = compaction !== null && typeof compaction === 'object' ? compaction as Record<string, unknown> : {}
-  const config = source.config !== null && typeof source.config === 'object' ? source.config as Record<string, unknown> : source
-  const thresholdRatio = typeof config.thresholdRatio === 'number' ? config.thresholdRatio : 0.8
-  const headroomTokens = typeof config.headroomTokens === 'number' ? config.headroomTokens : 0
-  const occupied = typeof event.data === 'object' && event.data !== null
-    ? readNonNegativeNumber((event.data as Record<string, unknown>).occupiedTokens)
-    : 0
-  return { thresholdRatio, headroomTokens, occupied }
+  compaction: CompactionServiceLike | undefined,
+): { thresholdRatio: number; headroomTokens: number } {
+  const config = compaction?.config
+  return {
+    thresholdRatio: typeof config?.thresholdRatio === 'number' ? config.thresholdRatio : 0.8,
+    headroomTokens: typeof config?.headroomTokens === 'number' ? config.headroomTokens : 65536,
+  }
+}
+
+/** Measure current model-visible pressure exactly as the official engine does. */
+export function readOccupancy(
+  tokenMeter: TokenMeterLike | undefined,
+  session: unknown,
+): { totalTokens: number; visibleNodeCount: number } {
+  const measurement = tokenMeter?.measure(session)
+  const totalTokens = typeof measurement?.totalTokens === 'number' ? measurement.totalTokens : 0
+  const visibleNodeCount = Array.isArray(measurement?.nodes) ? measurement.nodes.length : 0
+  return { totalTokens, visibleNodeCount }
 }
 
 function assertInteger(value: unknown, name: string): SessionSeq {
@@ -395,19 +327,18 @@ export function readEventRange(
 export function formatEventForExport(event: SessionEventLike): string {
   const seq = eventSeq(event) ?? -1
   const type = typeof event.type === 'string' ? event.type : 'unknown'
-  const data = eventData(event)
   return [
     `## seq ${seq} · ${type}`,
     '```json',
-    JSON.stringify(data, null, 2),
+    JSON.stringify(eventData(event), null, 2),
     '```',
   ].join('\n')
 }
 
-function resolveExportRoot(agent?: AgentLike, override?: string): string {
-  if (typeof override === 'string' && override.trim().length > 0) return path.resolve(override)
+function resolveWorkspaceRoot(agent?: AgentLike, exportPath?: string): string {
   const candidate = agent?.options?.cwd ?? agent?.cwd ?? agent?.options?.workspace ?? agent?.workspace
   if (typeof candidate === 'string' && candidate.trim().length > 0) return path.resolve(candidate)
+  if (exportPath !== void 0) return path.dirname(path.resolve(exportPath))
   throw new ContextToolError('no workspace cwd is available to hold the exported original; pass exportPath or run inside an agent with a cwd', 'WORKSPACE_UNAVAILABLE')
 }
 
@@ -418,10 +349,10 @@ export async function exportOriginal(
   events: readonly SessionEventLike[],
   exportPath?: string,
 ): Promise<string> {
-  const root = resolveExportRoot(agent, exportPath === void 0 ? void 0 : path.dirname(path.resolve(exportPath)))
   const requested = exportPath === void 0
-    ? path.join(root, `.dsh-context-compaction/original-${range.start}-${range.end}.md`)
+    ? path.join(resolveWorkspaceRoot(agent), `.dsh-context-compaction/original-${range.start}-${range.end}.md`)
     : path.resolve(exportPath)
+  const root = resolveWorkspaceRoot(agent, requested)
   if (!isInside(root, requested)) {
     throw new ContextToolError(`export path ${requested} is outside workspace root ${root}`, 'EXPORT_PATH_OUTSIDE_WORKSPACE')
   }
@@ -430,7 +361,7 @@ export async function exportOriginal(
     '',
     `- source seq range: ${range.start}..${range.end}`,
     `- events read: ${events.length}`,
-    '- Note: the host has no un-replace API. These events were NOT restored to the model-visible surface.',
+    '- The host has no un-replace API. These events were NOT restored to the model-visible surface.',
     '- Read this file to inspect the original text; it remains a workspace artifact.',
     '',
   ].join('\n')
@@ -458,32 +389,6 @@ interface SearchHit {
   surface: string
   type: string
   snippet: string
-}
-
-/** Search readable text from a set of events and return bounded hits. */
-export function searchReadableEvents(
-  events: readonly SessionEventLike[],
-  terms: readonly string[],
-  surface: string | null,
-  limit: number,
-): SearchHit[] {
-  const hits: SearchHit[] = []
-  for (const event of events) {
-    if (hits.length >= limit) break
-    const seq = eventSeq(event)
-    if (seq === null) continue
-    const text = readableEventText(event)
-    const lower = text.toLocaleLowerCase()
-    if (!terms.every((term) => lower.includes(term))) continue
-    const snippet = makeSnippet(text, terms[0])
-    hits.push({
-      seq,
-      surface: surface ?? 'log-only',
-      type: typeof event.type === 'string' ? event.type : 'unknown',
-      snippet,
-    })
-  }
-  return hits
 }
 
 /** Extract all user-readable text from an event without assuming a projection API. */
@@ -514,25 +419,60 @@ function makeSnippet(text: string, term: string): string {
   return (at > 0 ? '…' : '') + text.slice(at, end).replace(/\s+/gu, ' ') + (end < text.length ? '…' : '')
 }
 
+/** Search readable text from a set of events and return bounded hits. */
+export function searchReadableEvents(
+  events: readonly SessionEventLike[],
+  terms: readonly string[],
+  surface: string | null | ((event: SessionEventLike) => string),
+  limit: number,
+): SearchHit[] {
+  const hits: SearchHit[] = []
+  for (const event of events) {
+    if (hits.length >= limit) break
+    const seq = eventSeq(event)
+    if (seq === null) continue
+    const text = readableEventText(event)
+    const lower = text.toLocaleLowerCase()
+    if (!terms.every((term) => lower.includes(term))) continue
+    const resolvedSurface = typeof surface === 'function' ? surface(event) : (surface ?? 'log-only')
+    hits.push({
+      seq,
+      surface: resolvedSurface,
+      type: typeof event.type === 'string' ? event.type : 'unknown',
+      snippet: makeSnippet(text, terms[0]),
+    })
+  }
+  return hits
+}
+
+function normalizeJson(value: unknown): JsonValue {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(normalizeJson)
+  if (typeof value === 'object') {
+    const result: Record<string, JsonValue> = {}
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) result[key] = normalizeJson(item)
+    return result
+  }
+  return stringify(value)
+}
+
 /** Build the canonical context_status value. */
 export function buildStatusValue(input: {
   sessionId: string
-  config: { thresholdRatio: number; headroomTokens: number }
-  occupied: number
-  nodeCount: number
+  policy: { thresholdRatio: number; headroomTokens: number }
+  occupancy: { totalTokens: number; visibleNodeCount: number }
   records: readonly CompactionRecord[]
 }): JsonValue {
-  const thresholdTokens = Math.floor(input.occupied * input.config.thresholdRatio)
-  const remaining = Math.max(0, thresholdTokens - input.occupied)
+  const thresholdTokens = Math.floor(input.occupancy.totalTokens * input.policy.thresholdRatio)
   return {
     sessionId: input.sessionId,
     occupancy: {
-      occupiedTokens: input.occupied,
-      visibleNodeCount: input.nodeCount,
-      thresholdRatio: input.config.thresholdRatio,
+      totalTokens: input.occupancy.totalTokens,
+      visibleNodeCount: input.occupancy.visibleNodeCount,
+      thresholdRatio: input.policy.thresholdRatio,
       thresholdTokens,
-      headroomTokens: input.config.headroomTokens,
-      remainingTokensBeforeThreshold: remaining,
+      headroomTokens: input.policy.headroomTokens,
+      note: 'Occupancy is the official tokenMeter.measure(session).totalTokens pressure estimate, not a provider billing record.',
     },
     compactions: input.records.map((record) => {
       const compacted: Record<string, JsonValue> = {
@@ -551,7 +491,7 @@ export function buildStatusValue(input: {
       if (record.error !== void 0) compacted.error = record.error
       return compacted
     }),
-    note: 'Occupancy is an event-derived heuristic estimate, not the provider-billed token count. See context_expand for original events.',
+    note: 'Use context_expand to read a shadowed range and context_search to find text inside it.',
   }
 }
 
@@ -598,17 +538,6 @@ export function buildSearchValue(input: {
   }
 }
 
-function normalizeJson(value: unknown): JsonValue {
-  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') return value
-  if (Array.isArray(value)) return value.map(normalizeJson)
-  if (typeof value === 'object') {
-    const result: Record<string, JsonValue> = {}
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) result[key] = normalizeJson(item)
-    return result
-  }
-  return stringify(value)
-}
-
 /** Render a canonical value as one compact text block. */
 export function renderText(value: JsonValue): ContentBlock[] {
   return [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -620,3 +549,126 @@ export function errorResult(error: unknown): { isError: true; content: ContentBl
   const message = error instanceof Error ? error.message : String(error)
   return { isError: true, content: [{ type: 'text', text: `context tool error [${code}]: ${message}` }] }
 }
+
+function agentFrom(exec: ToolRunContext): AgentLike | undefined {
+  const agent = (exec as { agent?: unknown }).agent
+  return agent !== null && typeof agent === 'object' ? agent as AgentLike : void 0
+}
+
+function execSignal(exec: ToolRunContext): AbortSignal | undefined {
+  const signal = (exec as { signal?: unknown }).signal
+  return signal instanceof AbortSignal ? signal : void 0
+}
+
+/**
+ * Build and register `context_status`, `context_expand`, and `context_search`
+ * on `ctx.tools`. The definitions use the official `defineTool` shape:
+ * `name` / `description` / `parameters` / `output.schema` / `output.render`
+ * / `execute`.
+ */
+export function registerVisibilityTools(ctx: Context, options?: ToolContextOptions): () => void {
+  const runtimeOptions: ToolContextOptions = {
+    sessionQuery: options?.sessionQuery ?? (ctx.get('sessionQuery') as SessionQueryLike | undefined),
+    tokenMeter: options?.tokenMeter ?? (ctx.get('tokenMeter') as TokenMeterLike | undefined),
+    compaction: options?.compaction ?? (ctx.get('compaction') as CompactionServiceLike | undefined),
+  }
+  const disposers = [
+    ctx.tools.register(defineTool({
+      name: 'context_status',
+      description: 'Show the current context occupancy, the configured compaction threshold and headroom, and every compacted interval in this session. Use this before deciding whether an old topic has been compacted.',
+      parameters: {},
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => renderText(value),
+      },
+      async execute(_args, exec) {
+        try {
+          const prepared = await prepareSessionQuery(ctx, exec, agentFrom(exec), runtimeOptions)
+          const records = collectCompactionRecords(prepared.events)
+          const policy = readPolicy(runtimeOptions.compaction)
+          const occupancy = readOccupancy(runtimeOptions.tokenMeter, prepared.session)
+          return buildStatusValue({ sessionId: prepared.sessionId, policy, occupancy, records })
+        } catch (error) {
+          return errorValue(error)
+        }
+      },
+    })),
+    ctx.tools.register(defineTool({
+      name: 'context_expand',
+      description: 'Read the original events shadowed by compaction for an inclusive seq range and export them to a workspace file. The host has no un-replace API: this tool never restores the original to the model-visible surface; read the exported file to inspect the original text.',
+      parameters: {
+        start: { type: 'integer', required: true, description: 'Inclusive first session seq of the original range.' },
+        end: { type: 'integer', required: true, description: 'Inclusive last session seq of the original range.' },
+        exportPath: { type: 'string', description: 'Optional workspace-relative or absolute .md path for the exported original events.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => renderText(value),
+      },
+      async execute(args, exec) {
+        try {
+          const prepared = await prepareSessionQuery(ctx, exec, agentFrom(exec), runtimeOptions)
+          const range = parseRange(args.start, args.end)
+          const { found, missing } = readEventRange(prepared.events, range)
+          if (found.length === 0) throw new ContextToolError(`no events found for seq range ${range.start}..${range.end}; verify the range against context_status or context_search`, 'SEQ_NOT_FOUND')
+          const exportFile = await exportOriginal(agentFrom(exec), range, found, args.exportPath)
+          return buildExpandValue({ sessionId: prepared.sessionId, range, found, missing, exportFile })
+        } catch (error) {
+          return errorValue(error)
+        }
+      },
+    })),
+    ctx.tools.register(defineTool({
+      name: 'context_search',
+      description: 'Search readable text in this session and report matching events with their seq and snippet. Pass surface=shadowed to search only original events hidden by compaction; pass surface=all to search every durable event.',
+      parameters: {
+        query: { type: 'string', required: true, description: 'Case-insensitive literal search terms; regex syntax is treated as literal text.' },
+        surface: { type: 'string', enum: ['shadowed', 'all'], default: 'shadowed', description: 'Which durable event set to search.' },
+        limit: { type: 'integer', default: 20, description: 'Maximum number of hits to return (1-100).' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => renderText(value),
+      },
+      async execute(args, exec) {
+        try {
+          const prepared = await prepareSessionQuery(ctx, exec, agentFrom(exec), runtimeOptions)
+          const terms = parseSearchQuery(args.query)
+          const surface = args.surface === 'all' ? 'all' : 'shadowed'
+          const limit = typeof args.limit === 'number' && Number.isInteger(args.limit) && args.limit > 0
+            ? Math.min(args.limit, 100)
+            : 20
+          const shadowedSeqs = new Set(collectCompactionRecords(prepared.events).flatMap((record) => record.shadowedSeqs))
+          // A shadowed surface node may be referenced by `shadowedSeqs` while
+          // the durable event wrapper itself is log-only; therefore search
+          // the full durable log and attach the seq classification.
+          const candidates = prepared.events
+          const surfaceOf = (event: SessionEventLike): string => {
+            const seq = eventSeq(event)
+            return seq !== null && shadowedSeqs.has(seq) ? 'shadowed' : 'log-only'
+          }
+          const hits = searchReadableEvents(candidates, terms, surfaceOf, limit)
+          return buildSearchValue({ sessionId: prepared.sessionId, query: args.query, surface, hits, truncated: hits.length >= limit })
+        } catch (error) {
+          return errorValue(error)
+        }
+      },
+    })),
+  ]
+  return () => {
+    for (const dispose of disposers) dispose()
+  }
+}
+
+/**
+ * Render a thrown tool error as a canonical error value. Tool bodies do not
+ * return `isError`; the registry's error path renders the thrown message, so
+ * every failure is explicit and actionable rather than silent.
+ */
+function errorValue(error: unknown): JsonValue {
+  const code = error instanceof ContextToolError ? error.code : 'UNEXPECTED_ERROR'
+  const message = error instanceof Error ? error.message : String(error)
+  throw new ContextToolError(`${message} [${code}]`, code)
+}
+
+export type { ToolDefinition, ToolRunContext }

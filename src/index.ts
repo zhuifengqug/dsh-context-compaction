@@ -32,6 +32,8 @@
 import { ContextCompactionEngine, type ContextCompactionConfig } from './engine.ts'
 import { PLUGIN_CONFIG_KEYS, resolvePluginConfig, type PluginExtraConfig } from './config.ts'
 import { detectPriorCheckpoint, dominantLanguage, buildCompactionInstruction } from './instruction.ts'
+import { registerVisibilityTools, prepareSessionQuery, collectCompactionRecords, parseRange, readEventRange, exportOriginal, parseSearchQuery, searchReadableEvents, type ToolContextOptions } from './tools.ts'
+import type { Context } from '@deepseek-ai/cordis'
 
 export {
   ContextCompactionEngine,
@@ -40,6 +42,17 @@ export {
 }
 export { PLUGIN_CONFIG_KEYS, resolvePluginConfig, type PluginExtraConfig }
 export { detectPriorCheckpoint, dominantLanguage, buildCompactionInstruction }
+export {
+  registerVisibilityTools,
+  prepareSessionQuery,
+  collectCompactionRecords,
+  parseRange,
+  readEventRange,
+  exportOriginal,
+  parseSearchQuery,
+  searchReadableEvents,
+  type ToolContextOptions,
+}
 
 /** Cordis service identity kept identical to the official engine row. */
 export const name = 'compaction-basic'
@@ -49,3 +62,15 @@ export type { ContextCompactionConfig as CompactionEngineConfig }
 /** Re-export the inject list contract (same services as the official engine). */
 export const inject = ContextCompactionEngine.inject
 export type { Context as CordisContext } from '@deepseek-ai/cordis'
+
+/**
+ * Register the plugin's three visibility tools. The engine and the tools live
+ * in the same preset compaction realm, so the agent can call them without a
+ * host-plane mount.
+ * @param ctx - realm context exposing `tools`, `sessionQuery`, `tokenMeter`, and `compaction`.
+ * @param options - optional structural overrides for offline tests.
+ * @returns exact disposer that unregisters all three tools.
+ */
+export function setup(ctx: Context, options?: ToolContextOptions): () => void {
+  return registerVisibilityTools(ctx, options)
+}
