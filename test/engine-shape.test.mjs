@@ -18,7 +18,14 @@ test('extends the official BasicCompactionEngine and CompactionEngine service ba
 test('overrides only summarize; official operations are inherited, not redefined', () => {
   const ownMethods = Object.getOwnPropertyNames(ContextCompactionEngine.prototype)
     .filter((name) => name !== 'constructor')
-  assert.deepEqual(ownMethods, ['summarize'])
+  // The plugin may add private helpers of its own (e.g. registration wiring);
+  // what must never appear on the prototype is a redefinition of an OFFICIAL
+  // operation. Assert on that intent directly instead of a closed method list.
+  const officialOperations = ['compactIfNeeded', 'compactRegion', 'compactNow', 'regionDependencies']
+  for (const overridden of officialOperations) {
+    assert.equal(ownMethods.includes(overridden), false, `${overridden} must not be overridden`)
+  }
+  assert.ok(ownMethods.includes('summarize'), 'summarize must be the plugin hook')
   for (const inherited of ['compactIfNeeded', 'compactRegion', 'compactNow']) {
     assert.equal(Object.getOwnPropertyDescriptor(ContextCompactionEngine.prototype, inherited), undefined, `${inherited} must not be overridden`)
     assert.equal(typeof ContextCompactionEngine.prototype[inherited], 'function', `${inherited} must remain the official implementation`)

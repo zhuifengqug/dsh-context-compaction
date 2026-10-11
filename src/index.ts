@@ -33,6 +33,7 @@ import { ContextCompactionEngine, type ContextCompactionConfig } from './engine.
 import { PLUGIN_CONFIG_KEYS, resolvePluginConfig, type PluginExtraConfig } from './config.ts'
 import { detectPriorCheckpoint, dominantLanguage, buildCompactionInstruction } from './instruction.ts'
 import { registerVisibilityTools, prepareSessionQuery, collectCompactionRecords, parseRange, readEventRange, exportOriginal, parseSearchQuery, searchReadableEvents, type ToolContextOptions } from './tools.ts'
+import { registerSettingsEndpoint, ROUTE_PATH, settingsFilePath, readState } from './settings-endpoint.ts'
 import type { Context } from '@deepseek-ai/cordis'
 
 export {
@@ -53,7 +54,7 @@ export {
   searchReadableEvents,
   type ToolContextOptions,
 }
-
+export { registerSettingsEndpoint, ROUTE_PATH, settingsFilePath, readState }
 /** Cordis service identity kept identical to the official engine row. */
 export const name = 'compaction-basic'
 
@@ -64,13 +65,17 @@ export const inject = ContextCompactionEngine.inject
 export type { Context as CordisContext } from '@deepseek-ai/cordis'
 
 /**
- * Register the plugin's three visibility tools. The engine and the tools live
- * in the same preset compaction realm, so the agent can call them without a
- * host-plane mount.
+ * Register the plugin's three visibility tools against an explicit context.
+ *
+ * NOTE: this is a plain helper, NOT a Cordis lifecycle hook. A Cordis plugin's
+ * entry point is the exported class (see `ContextCompactionEngine`), whose
+ * constructor performs the real registration; the exports here exist for
+ * offline tests and for callers that own a realm context themselves.
+ *
  * @param ctx - realm context exposing `tools`, `sessionQuery`, `tokenMeter`, and `compaction`.
  * @param options - optional structural overrides for offline tests.
  * @returns exact disposer that unregisters all three tools.
  */
-export function setup(ctx: Context, options?: ToolContextOptions): () => void {
+export function registerToolsOn(ctx: Context, options?: ToolContextOptions): () => void {
   return registerVisibilityTools(ctx, options)
 }

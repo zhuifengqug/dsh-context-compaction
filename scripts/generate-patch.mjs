@@ -15,6 +15,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -26,6 +27,52 @@ const SNAPSHOT_DIR = join(ROOT, 'snapshots')
 const COVERED = ['standard', 'cordis', 'ptc']
 /** 本插件的包名——替换掉官方 compaction-basic 行的 name。 */
 const ENGINE_PACKAGE = '@gjs27/dsh-context-compaction'
+
+/**
+ * 读取用户通过设置卡片保存的阈值，派生 engine 行的 config 块。
+ *
+ * 为什么必须有 config：官方预设原本不给这一行任何 config，插件构造时
+ * `constructor(ctx, config = {})` 收到空对象即完全沿用官方默认
+ * （thresholdRatio 0.8 / headroomTokens 65536 / retainRatio 0.16），
+ * 诉求「触发更早」在运行态就不会生效。
+ *
+ * 配置文件由宿主半的 /api/context-compaction 端点写入；不存在时返回 null，
+ * 此时不写 config 块（行为等同官方默认）。
+ */
+function readEngineConfig() {
+  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim().length > 0
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  const file = join(home, 'context-compaction.json')
+  if (!existsSync(file)) return null
+  try {
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    const settings = doc && typeof doc === 'object' && doc.settings ? doc.settings : doc
+    if (!settings || typeof settings !== 'object') return null
+    const keys = ['thresholdRatio', 'headroomTokens', 'retainRatio', 'retainTokens']
+    const config = {}
+    for (const key of keys) {
+      const value = settings[key]
+      if (typeof value !== 'number' || !Number.isFinite(value)) return null
+      config[key] = value
+    }
+    // retainTokens=0 表示沿用 retainRatio，按官方语义省略该键。
+    if (config.retainTokens === 0) delete config.retainTokens
+    return config
+  } catch {
+    return null
+  }
+}
+
+/** 把 config 对象渲染为 YAML 行（保持与 name 同级缩进）。 */
+function renderConfigLines(config, indent) {
+  const pad = ' '.repeat(indent)
+  const lines = [`${pad}config:`]
+  for (const [key, value] of Object.entries(config)) {
+    lines.push(`${pad}  ${key}: ${value}`)
+  }
+  return lines
+}
 
 /**
  * 把官方 preset 原文的 `plugins:` 块提取为一个「行数组」，保留逐字内容，
@@ -64,7 +111,7 @@ function readScalar(text, key) {
  * 只在 isolate:{compaction:true,...} 组内的那一行生效——该行是
  * `- id: compaction-basic` 且紧随其后是 name: '@deepseek-ai/dsh-compaction-basic'。
  */
-function replaceEngineRow(block) {
+function replaceEngineRow(block, engineConfig) {
   const out = []
   let replaced = 0
   for (let i = 0; i < block.length; i += 1) {
@@ -76,6 +123,7 @@ function replaceEngineRow(block) {
         out.push(line)
         const indent = next.length - next.trimStart().length
         out.push(`${' '.repeat(indent)}name: '${ENGINE_PACKAGE}'`)
+        if (engineConfig !== null) out.push(...renderConfigLines(engineConfig, indent))
         i = nextIdx
         replaced += 1
         continue
@@ -113,6 +161,12 @@ const HEADER = `# @gjs27/dsh-context-compaction — preset 挂载层（自动生
 `
 
 const parts = [HEADER]
+const engineConfig = readEngineConfig()
+if (engineConfig !== null) {
+  console.log(`已读取用户阈值配置，写入 engine 行 config: ${JSON.stringify(engineConfig)}`)
+} else {
+  console.log('未找到用户阈值配置（$DSH_HOME/context-compaction.json），engine 行不写 config → 沿用官方默认')
+}
 for (const name of COVERED) {
   const snapPath = join(SNAPSHOT_DIR, `${name}.patch.yml`)
   if (!existsSync(snapPath)) throw new Error(`快照缺失: ${snapPath}`)
@@ -121,7 +175,7 @@ for (const name of COVERED) {
   const order = readScalar(text, 'order')
   if (configId === null || order === null) throw new Error(`${name}: 无法解析 config.id / config.order`)
   const { block } = extractPluginsBlock(text)
-  const patched = replaceEngineRow(block)
+  const patched = replaceEngineRow(block, engineConfig)
 
   parts.push(`
 - id: preset-${name}

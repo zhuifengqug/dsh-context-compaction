@@ -17,6 +17,66 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import { resolvePluginConfig, type ResolvedPluginConfig, type SummaryLanguage } from './config.ts'
+import { registerVisibilityTools, type ToolContextOptions } from './tools.ts'
+import { registerSettingsEndpoint, readStoredSettingsSync } from './settings-endpoint.ts'
+import { resolvePolicy, toEngineConfig, fromDocument } from './threshold-settings.ts'
+
+/** Structural view of the realm context the visibility tools need. */
+type ToolContextLike = Parameters<typeof registerVisibilityTools>[0] & ToolContextOptions
+
+/** Structural view of the host context the settings endpoint needs. */
+type SettingsHostContextLike = Parameters<typeof registerSettingsEndpoint>[0]
+
+/**
+ * Merge the saved threshold policy over the config the preset supplied,
+ * preserving the official mutual exclusion between `retainRatio` and
+ * `retainTokens`.
+ *
+ * The parent's `validatePolicy` rejects a config carrying both keys, so a naive
+ * spread would break construction whenever the caller pinned `retainTokens`
+ * with a number. Whichever retention key the saved settings resolve to wins,
+ * and the other one is dropped rather than left behind.
+ *
+ * @param base - config the preset patch supplied.
+ * @param saved - validated settings read from the card's file.
+ * @returns config safe for the parent constructor.
+ */
+export function mergeThresholds(base: Record<string, unknown>, saved: unknown) {
+  // Accept both the persisted envelope ({version, settings}) and bare settings,
+  // so a caller cannot accidentally pass the wrong shape and get `undefined`
+  // threshold keys. `fromDocument` also rejects out-of-range values.
+  const settings = fromDocument(saved)
+  // No usable saved settings means "no override": the preset's own config
+  // passes through untouched, so a caller-pinned retainTokens keeps working.
+  if (settings === void 0) return { ...base }
+  const { policy } = resolvePolicy(settings)
+  const engine = toEngineConfig(policy)
+  const merged: Record<string, unknown> = { ...base, ...engine }
+  if ('retainTokens' in engine) delete merged.retainRatio
+  else delete merged.retainTokens
+  return merged
+}
+
+/**
+ * Read the card's saved thresholds without ever throwing.
+ *
+ * Construction must not fail because of a settings file: an unreadable or
+ * malformed file simply means "no override", and compaction keeps working on
+ * the policy the preset patch supplied.
+ * @returns saved settings, or `undefined` when absent/unusable.
+ */
+function safeReadSaved() {
+  try {
+    return readStoredSettingsSync()
+  } catch {
+    return void 0
+  }
+}
+
+/** Minimal logger surface used for non-fatal registration warnings. */
+interface OptionalLogger {
+  readonly logger?: { warn?: (message: string, ...args: unknown[]) => void }
+}
 
 /**
  * Structural mirrors of the official `SummarizationInput` / `SummaryResult`
@@ -120,8 +180,38 @@ export class ContextCompactionEngine extends BasicCompactionEngine {
 
   constructor(ctx: Context, config: ContextCompactionConfig = {}) {
     const { retentionInstructions, incremental, summaryLanguage, ...base } = config
-    super(ctx, base)
+    // The settings card owns the tunable policy: its saved file, when present,
+    // overrides the threshold keys the preset patch supplied. That keeps the
+    // card authoritative without needing an official config-editor write path,
+    // which cannot address an engine row nested inside a preset.
+    const saved = safeReadSaved()
+    const withSaved = mergeThresholds(base as Record<string, unknown>, saved)
+    super(ctx, withSaved as ContextCompactionConfig)
     this.plugin = resolvePluginConfig({ retentionInstructions, incremental, summaryLanguage })
+    // The compaction realm owns these registrations: a Cordis plugin class has no
+    // `setup` lifecycle hook, so the constructor (and ctx.effect) is the only
+    // place they can be installed. Registering here also keeps the tools inside
+    // the same realm as the engine, so `ctx.tools` / `ctx.sessionQuery` resolve.
+    this.installRegistrations(ctx)
+  }
+
+  /**
+   * Install this plugin's session tools and the settings-card endpoint.
+   * @param ctx - the engine's owning context.
+   */
+  private installRegistrations(ctx: Context): void {
+    const logger = (ctx as unknown as OptionalLogger).logger
+    try {
+      ctx.effect(() => registerVisibilityTools(ctx as unknown as ToolContextLike), 'context-compaction: tools')
+    } catch (error) {
+      // A tooling realm without `ctx.tools` must not break compaction itself.
+      logger?.warn?.('context-compaction: visibility tools not registered: %s', String((error as Error)?.message ?? error))
+    }
+    try {
+      registerSettingsEndpoint(ctx as unknown as SettingsHostContextLike)
+    } catch (error) {
+      logger?.warn?.('context-compaction: settings endpoint not registered: %s', String((error as Error)?.message ?? error))
+    }
   }
 
   /**
