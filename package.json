@@ -47,8 +47,9 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
+    "check:client": "node scripts/check-client-bundle.mjs",
     "test": "node --test \"test/**/*.test.mjs\"",
-    "check": "npm run typecheck && npm run build && npm run test"
+    "check": "npm run typecheck && npm run build && npm run check:client && npm run test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
