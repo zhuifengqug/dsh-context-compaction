@@ -21,6 +21,20 @@
 #
 # 覆盖范围（t1 裁定）：preset-standard（默认）+ preset-cordis（本机实测在用）
 #   + preset-ptc；preset-minimal 无 compaction 组，不需要覆盖。
+#
+# ⚠️ 文件开头还有一个 `- insert:` 根层行，它同样不可省略：
+#   DSH 的客户端模块系统（dsh-client-modules）按 **Loader 行** 发现包的客户端
+#   半（resolveMeta → locatePkgJson(loaderName)），遍历的是根 Include 下的行。
+#   只把 name 写进 preset 内部，客户端加载器遍历根层时根本遇不到本包，
+#   dsh.client 声明形同不存在 —— 表现就是「设置项不出现」。
+#   宿主侧的 Config 活动态同样查不到任何指向本包的 entry。
+
+# 根层行：让宿主半与客户端半都有一行可被 Loader/客户端模块系统发现。
+# 缺这一行时 preset 内的 name 替换仍生效（引擎正常工作），
+# 但本包的 dsh.client 永不加载、上下文压缩设置项不会出现在设置页。
+- insert:
+    - id: context-compaction
+      name: '@gjs27/dsh-context-compaction'
 
 
 - id: preset-standard
