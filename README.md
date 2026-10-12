@@ -117,31 +117,37 @@ thresholdTokens = floor(min(contextWindow × thresholdRatio, messageBudget − h
 
 - **宿主**：DSH `0.2.0-rc.2`。`peerDependencies` 对 `@deepseek-ai/dsh*` 写**精确版本**（预发布排序下 `^0.2.0` 会被宿主兼容校验 deny）。
 
-### 挂载范围：两类 preset，两种覆盖方式
+### 挂载范围：三类承载位置，两条覆盖路径
 
-压缩引擎有两处可能的位置，覆盖方式不同 —— **漏掉任何一类，那个 preset 下的会话就仍按官方 0.8 触发，表现像「设置没生效」**。
+压缩引擎可能出现在三个地方 —— **漏掉任何一处，那个 preset 下的会话就仍按官方 0.8 触发，表现像「设置没生效」，且没有任何报错**。
 
-| preset | 位置 | 覆盖方式 |
+| 位置 | 是什么 | 覆盖方式 |
 |---|---|---|
-| 官方 `standard` / `cordis` / `ptc` | DSH 安装树 `dsh-web-app/presets/` | profile 的 bundle patch 整行替换 config（`cordis.patch.yml`） |
-| **用户自建** `$DSH_HOME/.agent-presets/<name>/agent.cordis.yml` | 你的 home 目录 | **不走 patch 链**，需直接改写文件 |
+| DSH 安装树 `dsh-web-app/presets/` | 官方 `standard` / `cordis` / `ptc` | profile 的 bundle patch 整行替换 config |
+| `$DSH_HOME/.agent-presets/<name>/agent.cordis.yml` | 你的自建 preset | 直接改写文件 |
+| 各插件 `node_modules` 内的 preset 模板 | 新建/重装 preset 的**来源** | 直接改写文件（`--templates`） |
 
 `preset-minimal` 无 compaction 组，不需要覆盖。
 
-自建 preset 必须显式同步一次，否则它里面的引擎仍是官方包：
+**新建或重装 preset 后跑一次：**
 
 ```bash
-node scripts/sync-custom-presets.mjs            # 只读扫描，列出待改写的 preset
-node scripts/sync-custom-presets.mjs --apply    # 写入（原文件备份为 .bak-engine）
+node scripts/sync-custom-presets.mjs                      # 只读扫描
+node scripts/sync-custom-presets.mjs --apply              # 修活跃自建 preset
+node scripts/sync-custom-presets.mjs --apply --templates  # 连来源模板一起修
 ```
 
-**每建一个新 preset、或每次 DSH 升级后，跑一次覆盖总览：**
+**任何改动后用总览复查：**
 
 ```bash
 node scripts/check-engine-coverage.mjs
 ```
 
-它列出每个 preset 实际使用的引擎；`exit 1` 表示有 preset 未覆盖。只改 engine 行的 `name`，阈值仍以 `$DSH_HOME/context-compaction.json` 为单一真源。
+它列出每个活跃 preset 与每个来源模板实际使用的引擎；`exit 1` 表示有活跃 preset 未覆盖。只改 engine 行的 `name`，阈值仍以 `$DSH_HOME/context-compaction.json` 为单一真源。
+
+> **为什么不能全自动**：DSH 没有在 preset 挂载前改写其 composition 的扩展点（`dsh-agent-preset-registry` 的挂载路径无 waterfall 钩子），preset 定义是静态文件，且官方 preset 位于只读安装树。所以新增 preset 必须显式同步一次 —— 这是架构决定的，不是实现取舍。
+>
+> **会回退的情形**：模板文件位于其它插件的 `node_modules` 内，那些插件升级/重装时会还原它们。届时重跑上面的命令，`check-engine-coverage.mjs` 也会把它标为 `✗`。
 
 ### ⚠️ DSH 升级后必做
 

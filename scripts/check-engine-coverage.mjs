@@ -99,9 +99,75 @@ for (const r of rows) {
 const missing = rows.filter((r) => !r.ok)
 console.log('-'.repeat(78))
 if (missing.length === 0) {
-  console.log('✓ 全部覆盖：卡片阈值在所有含 compaction 的 preset 上生效。')
+  console.log('✓ 活跃 preset 全部覆盖：卡片阈值在所有含 compaction 的 preset 上生效。')
+} else {
+  console.log(`✗ ${missing.length} 个活跃 preset 未覆盖，其会话仍按官方默认 thresholdRatio 0.8 触发：`)
+  for (const r of missing) console.log(`   - ${r.preset}（${r.how}）`)
+}
+
+// ── 未来 preset 的来源模板 ────────────────────────────────────────────────
+// 这些文件不是活跃 preset，但新建/重装 preset 时会被复制或应用。
+// 它们被插件升级还原后不会影响当前会话，却会让「下一个新建的 preset」
+// 一出生就带官方引擎 —— 所以单独列出来。
+const templateRows = []
+const modulesDir = join(home, 'profiles', 'desktop', 'node_modules')
+if (existsSync(modulesDir)) {
+  const patterns = [
+    /preset[\\/]agent\.cordis\.yml$/,
+    /presets[\\/][^\\/]+[\\/]agent\.cordis\.yml$/,
+    /preset\.generated\.patch\.yml$/,
+  ]
+  const walk = (dir, depth) => {
+    if (depth > 4) return
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      const p = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' && depth > 0) continue
+        walk(p, depth + 1)
+        continue
+      }
+      if (!/\.ya?ml$/.test(e.name)) continue
+      if (!patterns.some((re) => re.test(p))) continue
+      const text = readFileSync(p, 'utf8')
+      if (!text.includes('compaction: true') && !text.includes('compaction-basic')) continue
+      const hasPlugin = text.includes(PLUGIN_ENGINE)
+      const hasOfficial = text.includes(OFFICIAL_ENGINE)
+      templateRows.push({
+        file: p.replace(modulesDir, '…node_modules'),
+        ok: hasPlugin && !hasOfficial,
+      })
+    }
+  }
+  walk(modulesDir, 0)
+}
+
+if (templateRows.length > 0) {
+  console.log('')
+  console.log('未来 preset 的来源模板（不是活跃 preset，但决定新建/重装 preset 用什么引擎）')
+  console.log('-'.repeat(78))
+  for (const r of templateRows) {
+    console.log(`${r.ok ? '✓' : '✗'}  ${r.file}`)
+  }
+  const badTemplates = templateRows.filter((r) => !r.ok)
+  if (badTemplates.length > 0) {
+    console.log(`✗ ${badTemplates.length} 个模板仍是官方引擎 —— 新建的 preset 会继承它：`)
+    console.log('   node scripts/sync-custom-presets.mjs --apply --templates')
+  } else {
+    console.log('✓ 模板全部已换为本插件：新建的 preset 会直接继承本插件引擎。')
+  }
+}
+
+const templateMissing = templateRows.filter((r) => !r.ok)
+console.log('-'.repeat(78))
+if (missing.length === 0 && templateMissing.length === 0) {
+  console.log('✓ 全覆盖：活跃 preset 与来源模板都已使用本插件引擎。')
   process.exit(0)
 }
-console.log(`✗ ${missing.length} 个 preset 未覆盖，其会话仍按官方默认 thresholdRatio 0.8 触发：`)
-for (const r of missing) console.log(`   - ${r.preset}`)
-process.exit(1)
+if (missing.length > 0) {
+  console.log('✗ 存在未覆盖的活跃 preset，其会话不按卡片阈值压缩。')
+  process.exit(1)
+}
+console.log('△ 活跃 preset 已全覆盖；但有来源模板仍是官方引擎（影响未来新建的 preset）。')
+process.exit(0)
