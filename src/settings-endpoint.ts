@@ -144,7 +144,7 @@ export async function readState(file: string) {
     presets: RECOMMENDED_PRESETS,
     fields: fieldMetadata(),
     path: file,
-    note: 'Saved values override the official engine defaults (thresholdRatio 0.8 / headroomTokens 65536 / retainRatio 0.16). They take effect for sessions started after the engine entry reloads.',
+    note: 'Saved values override the official engine defaults (thresholdRatio 0.8 / headroomTokens 65536 / retainRatio 0.16). The engine reads this file when its preset is mounted, and preset plugin trees are shared for the process lifetime — restart DSH to apply a change.',
   }
 }
 

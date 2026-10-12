@@ -73,7 +73,7 @@ pnpm run build
 
 点保存后写入 `$DSH_HOME/context-compaction.json`。
 
-> **生效时机**：阈值在引擎构造时读取，所以**新开的会话**按新阈值压缩，**正在进行的会话不受影响**。
+> **生效时机**：引擎在 preset 挂载时读取该文件，而 DSH 的 preset 插件树在进程内按 revision 共享挂载。因此**改完设置请重启 DSH** 再观察；重启前已挂载的 preset 仍用旧值。
 
 ### 三个查询工具
 
@@ -116,7 +116,32 @@ thresholdTokens = floor(min(contextWindow × thresholdRatio, messageBudget − h
 ## 兼容性
 
 - **宿主**：DSH `0.2.0-rc.2`。`peerDependencies` 对 `@deepseek-ai/dsh*` 写**精确版本**（预发布排序下 `^0.2.0` 会被宿主兼容校验 deny）。
-- **挂载范围**：`preset-standard`、`preset-cordis`、`preset-ptc`。`preset-minimal` 无 compaction 组，不需要覆盖。
+
+### 挂载范围：两类 preset，两种覆盖方式
+
+压缩引擎有两处可能的位置，覆盖方式不同 —— **漏掉任何一类，那个 preset 下的会话就仍按官方 0.8 触发，表现像「设置没生效」**。
+
+| preset | 位置 | 覆盖方式 |
+|---|---|---|
+| 官方 `standard` / `cordis` / `ptc` | DSH 安装树 `dsh-web-app/presets/` | profile 的 bundle patch 整行替换 config（`cordis.patch.yml`） |
+| **用户自建** `$DSH_HOME/.agent-presets/<name>/agent.cordis.yml` | 你的 home 目录 | **不走 patch 链**，需直接改写文件 |
+
+`preset-minimal` 无 compaction 组，不需要覆盖。
+
+自建 preset 必须显式同步一次，否则它里面的引擎仍是官方包：
+
+```bash
+node scripts/sync-custom-presets.mjs            # 只读扫描，列出待改写的 preset
+node scripts/sync-custom-presets.mjs --apply    # 写入（原文件备份为 .bak-engine）
+```
+
+**每建一个新 preset、或每次 DSH 升级后，跑一次覆盖总览：**
+
+```bash
+node scripts/check-engine-coverage.mjs
+```
+
+它列出每个 preset 实际使用的引擎；`exit 1` 表示有 preset 未覆盖。只改 engine 行的 `name`，阈值仍以 `$DSH_HOME/context-compaction.json` 为单一真源。
 
 ### ⚠️ DSH 升级后必做
 
@@ -161,6 +186,9 @@ scripts/
   generate-patch.mjs     从 snapshots/ 派生 cordis.patch.yml
   verify-composition.mjs 快照 vs 宿主结构比对（防腐化）
   sync-profile-patch.mjs 把生成的 preset 段同步进 profile patch
+  add-root-row.mjs       把根层 Loader 行同步进 profile patch
+  sync-custom-presets.mjs 把自建 preset 的引擎换成本插件
+  check-engine-coverage.mjs 全量覆盖总览（官方 + 自建 preset）
   check-client-bundle.mjs 客户端 bundle 离线加载校验
 snapshots/               官方 preset 原文快照（逐字保留）
 ```

@@ -7,6 +7,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { resolvePluginConfig } from '../lib/config.js'
 import { ContextCompactionEngine } from '../lib/index.js'
+import { isolateDshHome } from './helpers/isolate-home.mjs'
+
+// These tests assert the OFFICIAL defaults; isolate the engine from a real
+// $DSH_HOME/context-compaction.json, which would otherwise override them.
+isolateDshHome()
 
 function stubCtx() {
   return {

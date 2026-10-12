@@ -21,6 +21,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { ContextCompactionEngine } from '../lib/index.js'
+import { isolateDshHome } from './helpers/isolate-home.mjs'
+
+// This file asserts the OFFICIAL default threshold (0.8) as its baseline, so it
+// must not pick up a real $DSH_HOME/context-compaction.json.
+isolateDshHome()
 
 const CONTEXT_WINDOW = 256000
 const RESERVED_COMPLETION = 32768

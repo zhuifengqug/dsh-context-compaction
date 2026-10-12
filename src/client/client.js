@@ -25,11 +25,11 @@ window.__ModuleLoader__.load({ id: "@gjs27/dsh-context-compaction", factory: (re
 		const DICTS = {
 			zh: {
 				label: "上下文压缩",
-				desc: "调整自动压缩的触发时机。保存后，新开的会话按新阈值压缩；已在进行中的会话不受影响。",
+				desc: "调整自动压缩的触发时机。保存后重启 DSH 生效：预设的插件树在进程内按版本共享挂载，重启前已挂载的预设仍用旧值。",
 				loading: "加载中…",
 				save: "保存",
 				saving: "保存中…",
-				saved: "已保存。新会话按新阈值生效。",
+				saved: "已保存。重启 DSH 后按新阈值生效。",
 				saveError: "保存失败: {error}",
 				readError: "读取失败: {error}",
 				unknownError: "未知错误",
@@ -57,11 +57,11 @@ window.__ModuleLoader__.load({ id: "@gjs27/dsh-context-compaction", factory: (re
 			},
 			en: {
 				label: "Context Compaction",
-				desc: "Tune when auto-compaction triggers. After saving, newly started sessions compact at the new thresholds; sessions already running are unaffected.",
+				desc: "Tune when auto-compaction triggers. Restart DSH after saving: preset plugin trees are mounted once per revision and shared for the process lifetime, so a preset already mounted keeps its previous values.",
 				loading: "Loading…",
 				save: "Save",
 				saving: "Saving…",
-				saved: "Saved. New sessions use the new thresholds.",
+				saved: "Saved. Restart DSH to apply the new thresholds.",
 				saveError: "Failed to save: {error}",
 				readError: "Failed to read: {error}",
 				unknownError: "Unknown error",
