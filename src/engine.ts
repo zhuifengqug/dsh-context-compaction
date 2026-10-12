@@ -19,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { resolvePluginConfig, type ResolvedPluginConfig, type SummaryLanguage } from './config.ts'
 import { registerVisibilityTools, type ToolContextOptions } from './tools.ts'
 import { registerSettingsEndpoint, readStoredSettingsSync } from './settings-endpoint.ts'
+import { installPresetAutosync, type AutosyncContext as AutosyncHostContext } from './preset-autosync.ts'
 import { resolvePolicy, toEngineConfig, fromDocument } from './threshold-settings.ts'
 
 /** Structural view of the realm context the visibility tools need. */
@@ -196,7 +197,8 @@ export class ContextCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
-   * Install this plugin's session tools and the settings-card endpoint.
+   * Install this plugin's session tools, the settings-card endpoint, and the
+   * preset-engine autosync.
    * @param ctx - the engine's owning context.
    */
   private installRegistrations(ctx: Context): void {
@@ -211,6 +213,15 @@ export class ContextCompactionEngine extends BasicCompactionEngine {
       registerSettingsEndpoint(ctx as unknown as SettingsHostContextLike)
     } catch (error) {
       logger?.warn?.('context-compaction: settings endpoint not registered: %s', String((error as Error)?.message ?? error))
+    }
+    try {
+      // Presets the user authors, and the templates other plugins ship, name
+      // the engine inside their own static files and never pass through this
+      // plugin's bundle patch. Without this, such a preset keeps the official
+      // engine whose thresholdRatio is 0.8 and the settings card looks inert.
+      installPresetAutosync(ctx as unknown as AutosyncHostContext)
+    } catch (error) {
+      logger?.warn?.('context-compaction: preset autosync not started: %s', String((error as Error)?.message ?? error))
     }
   }
 

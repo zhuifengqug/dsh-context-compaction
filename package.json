@@ -49,6 +49,7 @@
     "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
     "check:client": "node scripts/check-client-bundle.mjs",
     "check:coverage": "node scripts/check-engine-coverage.mjs",
+    "check:autosync": "node scripts/verify-autosync.mjs",
     "test": "node --test \"test/**/*.test.mjs\"",
     "check": "npm run typecheck && npm run build && npm run check:client && npm run test"
   },

@@ -117,37 +117,40 @@ thresholdTokens = floor(min(contextWindow × thresholdRatio, messageBudget − h
 
 - **宿主**：DSH `0.2.0-rc.2`。`peerDependencies` 对 `@deepseek-ai/dsh*` 写**精确版本**（预发布排序下 `^0.2.0` 会被宿主兼容校验 deny）。
 
-### 挂载范围：三类承载位置，两条覆盖路径
+### 挂载范围：三类承载位置，**自动覆盖**
 
 压缩引擎可能出现在三个地方 —— **漏掉任何一处，那个 preset 下的会话就仍按官方 0.8 触发，表现像「设置没生效」，且没有任何报错**。
 
 | 位置 | 是什么 | 覆盖方式 |
 |---|---|---|
 | DSH 安装树 `dsh-web-app/presets/` | 官方 `standard` / `cordis` / `ptc` | profile 的 bundle patch 整行替换 config |
-| `$DSH_HOME/.agent-presets/<name>/agent.cordis.yml` | 你的自建 preset | 直接改写文件 |
-| 各插件 `node_modules` 内的 preset 模板 | 新建/重装 preset 的**来源** | 直接改写文件（`--templates`） |
+| `$DSH_HOME/.agent-presets/<name>/agent.cordis.yml` | 你的自建 preset | **插件自动改写** |
+| 各插件 `node_modules` 内的 preset 模板 | 新建/重装 preset 的**来源** | **插件自动改写** |
 
 `preset-minimal` 无 compaction 组，不需要覆盖。
 
-**新建或重装 preset 后跑一次：**
+**你不需要为新建的 preset 做任何事。** 插件启动时会扫描上述位置并换掉官方引擎，之后持续监听：
+
+- **即时通道**：监视 preset 根目录，新建/安装 preset 后约 1.5 秒内改写（等文件写入稳定后才动手）。
+- **兜底扫描**：每 15 秒扫一遍，覆盖「根目录当时还不存在」「改动发生在监听忙时」等监视器会漏掉的情况。
+
+每次改写都会写日志（`context-compaction: preset engine switched to this plugin: …`），且**首次改写前会备份**为 `.bak-engine` —— 不会有静默修改。
+
+只改 engine 行的 `name`，阈值仍以 `$DSH_HOME/context-compaction.json` 为单一真源，不会把同一数值复制进每个 preset。
+
+**想确认覆盖状态，或需要手动补一次：**
 
 ```bash
-node scripts/sync-custom-presets.mjs                      # 只读扫描
-node scripts/sync-custom-presets.mjs --apply              # 修活跃自建 preset
-node scripts/sync-custom-presets.mjs --apply --templates  # 连来源模板一起修
+node scripts/check-engine-coverage.mjs          # 全量总览，未覆盖 exit 1
+node scripts/verify-autosync.mjs                # 实证自动覆盖真的生效
+node scripts/sync-custom-presets.mjs --apply --templates   # 手动补（正常不需要）
 ```
 
-**任何改动后用总览复查：**
-
-```bash
-node scripts/check-engine-coverage.mjs
-```
-
-它列出每个活跃 preset 与每个来源模板实际使用的引擎；`exit 1` 表示有活跃 preset 未覆盖。只改 engine 行的 `name`，阈值仍以 `$DSH_HOME/context-compaction.json` 为单一真源。
-
-> **为什么不能全自动**：DSH 没有在 preset 挂载前改写其 composition 的扩展点（`dsh-agent-preset-registry` 的挂载路径无 waterfall 钩子），preset 定义是静态文件，且官方 preset 位于只读安装树。所以新增 preset 必须显式同步一次 —— 这是架构决定的，不是实现取舍。
+> **为什么官方 preset 仍需 patch**：官方 preset 位于**只读安装树**，插件不能写它，只能由 profile 的 bundle patch 覆盖 —— 这条路径是静态的，不参与自动扫描。
 >
-> **会回退的情形**：模板文件位于其它插件的 `node_modules` 内，那些插件升级/重装时会还原它们。届时重跑上面的命令，`check-engine-coverage.mjs` 也会把它标为 `✗`。
+> **会回退的情形**：模板文件位于其它插件的 `node_modules` 内，那些插件升级/重装时会还原它们。插件会在下一次扫描（最多 15 秒）自动改回；`check-engine-coverage.mjs` 也会把它标为 `✗`。
+>
+> **代价**：插件在宿主进程内持有目录监视器与一个 15 秒定时器（均已 `unref`，不影响宿主退出）。这是「新 preset 自动生效」的代价。
 
 ### ⚠️ DSH 升级后必做
 
@@ -187,14 +190,16 @@ src/
   tools.ts               三个查询工具
   threshold-settings.ts  阈值模型（纯逻辑，无 IO，可离线测）
   settings-endpoint.ts   宿主半：/api/context-compaction 端点
+  preset-autosync.ts     preset 引擎自动覆盖（监视 + 兜底扫描）
   client/client.js       客户端半：设置页卡片（手写 __ModuleLoader__，无构建步骤）
 scripts/
   generate-patch.mjs     从 snapshots/ 派生 cordis.patch.yml
   verify-composition.mjs 快照 vs 宿主结构比对（防腐化）
   sync-profile-patch.mjs 把生成的 preset 段同步进 profile patch
   add-root-row.mjs       把根层 Loader 行同步进 profile patch
-  sync-custom-presets.mjs 把自建 preset 的引擎换成本插件
-  check-engine-coverage.mjs 全量覆盖总览（官方 + 自建 preset）
+  sync-custom-presets.mjs 手动把 preset 引擎换成本插件（自动覆盖的补充手段）
+  check-engine-coverage.mjs 全量覆盖总览（活跃 preset + 来源模板）
+  verify-autosync.mjs    实证自动覆盖生效（起真实监视器，新建文件看是否被自动改写）
   check-client-bundle.mjs 客户端 bundle 离线加载校验
 snapshots/               官方 preset 原文快照（逐字保留）
 ```
